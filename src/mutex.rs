@@ -126,9 +126,27 @@ impl<T> Mutex<T>
 
 impl<T: ?Sized> Mutex<T>
 {
+    #[cfg(target_has_atomic = "cas")]
+    fn acquire_cas_lock(&self, old: bool, new: bool) -> bool
+    {
+        self.lock.compare_and_swap(old, new, Ordering::Acquire)
+    }
+
+    #[cfg(not(target_has_atomic = "cas"))]
+    fn acquire_cas_lock(&self, old: bool, new: bool) -> bool
+    {
+        let x = self.lock.load(Ordering::SeqCst);
+        if x == old {
+            self.lock.store(new, Ordering::SeqCst);
+            old
+        } else {
+            x
+        }
+    }
+
     fn obtain_lock(&self)
     {
-        while self.lock.compare_and_swap(false, true, Ordering::Acquire) != false
+        while self.acquire_cas_lock(false, true) != false
         {
             // Wait until the lock looks unlocked before retrying
             while self.lock.load(Ordering::Relaxed)
@@ -178,7 +196,7 @@ impl<T: ?Sized> Mutex<T>
     /// a guard within Some.
     pub fn try_lock(&self) -> Option<MutexGuard<T>>
     {
-        if self.lock.compare_and_swap(false, true, Ordering::Acquire) == false
+        if self.acquire_cas_lock(false, true) == false
         {
             Some(
                 MutexGuard {

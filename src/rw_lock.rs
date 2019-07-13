@@ -140,6 +140,96 @@ impl<T> RwLock<T> {
     }
 }
 
+fn disable_interrupts() {
+    unsafe {
+        extern "C" {
+            fn __cpsid();
+        }
+
+        // XXX do we need a explicit compiler barrier here?
+        __cpsid();
+    }
+}
+
+fn enable_interrupts() {
+    unsafe {
+        extern "C" {
+            fn __cpsie();
+        }
+
+        // XXX do we need a explicit compiler barrier here?
+        __cpsie();
+    }
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn atomic_rmw<F>(lock: &AtomicUsize, f: F) -> usize
+where
+    F: FnOnce(usize) -> usize
+{
+    disable_interrupts();
+    let x = lock.load(Ordering::SeqCst);
+    lock.store(f(x), Ordering::SeqCst);
+    enable_interrupts();
+    x
+}
+
+#[cfg(target_has_atomic = "cas")]
+fn fetch_sub(lock: &AtomicUsize, n: usize, order: Ordering) -> usize
+{
+    lock.fetch_sub(n, order);
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn fetch_sub(lock: &AtomicUsize, n: usize, _order: Ordering) -> usize
+{
+    atomic_rmw(lock, |x| x - n)
+}
+
+#[cfg(target_has_atomic = "cas")]
+fn fetch_add(lock: &AtomicUsize, n: usize, order: Ordering) -> usize
+{
+    lock.fetch_add(n, order);
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn fetch_add(lock: &AtomicUsize, n: usize, _order: Ordering) -> usize
+{
+    atomic_rmw(lock, |x| x + n)
+}
+
+#[cfg(target_has_atomic = "cas")]
+fn fetch_or(lock: &AtomicUsize, n: usize, order: Ordering) -> usize
+{
+    lock.fetch_or(n, order);
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn fetch_or(lock: &AtomicUsize, n: usize, _order: Ordering) -> usize
+{
+    atomic_rmw(lock, |x| x | n)
+}
+
+
+#[cfg(target_has_atomic = "cas")]
+fn fetch_and(lock: &AtomicUsize, n: usize, order: Ordering) -> usize
+{
+    lock.fetch_and(n, order);
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn fetch_and(lock: &AtomicUsize, n: usize, _order: Ordering) -> usize
+{
+    atomic_rmw(lock, |x| x & n)
+}
+
+
+#[cfg(target_has_atomic = "cas")]
+fn cas_lock(lock: &AtomicUsize, old: usize, new: usize) -> usize
+{
+    lock.compare_and_swap(old, new, Ordering::SeqCst)
+}
+
 impl<T: ?Sized> RwLock<T> {
     /// Locks this rwlock with shared read access, blocking the current thread
     /// until it can be acquired.
@@ -196,13 +286,13 @@ impl<T: ?Sized> RwLock<T> {
     /// ```
     #[inline]
     pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
-        let value = self.lock.fetch_add(READER, Ordering::Acquire);
+        let value = fetch_add(&self.lock, READER, Ordering::Acquire);
 
         // We check the UPGRADED bit here so that new readers are prevented when an UPGRADED lock is held.
         // This helps reduce writer starvation.
         if value & (WRITER | UPGRADED) != 0 {
             // Lock is taken, undo.
-            self.lock.fetch_sub(READER, Ordering::Release);
+            fetch_sub(&self.lock, READER, Ordering::Release);
             None
         } else {
             Some(RwLockReadGuard {
@@ -221,7 +311,7 @@ impl<T: ?Sized> RwLock<T> {
     #[inline]
     pub unsafe fn force_read_decrement(&self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !WRITER > 0);
-        self.lock.fetch_sub(READER, Ordering::Release);
+        fetch_sub(&self.lock, READER, Ordering::Release);
     }
 
     /// Force unlock exclusive write access.
@@ -233,7 +323,7 @@ impl<T: ?Sized> RwLock<T> {
     #[inline]
     pub unsafe fn force_write_unlock(&self) {
         debug_assert_eq!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED), 0);
-        self.lock.fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+        fetch_and(&self.lock, !(WRITER | UPGRADED), Ordering::Release);
     }
 
     #[inline(always)]
@@ -325,7 +415,7 @@ impl<T: ?Sized> RwLock<T> {
     /// Tries to obtain an upgradeable lock guard.
     #[inline]
     pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradeableGuard<T>> {
-        if self.lock.fetch_or(UPGRADED, Ordering::Acquire) & (WRITER | UPGRADED) == 0 {
+        if fetch_or(&self.lock, UPGRADED, Ordering::Acquire) & (WRITER | UPGRADED) == 0 {
             Some(RwLockUpgradeableGuard {
                 lock: &self.lock,
                 data: unsafe { NonNull::new_unchecked(self.data.get()) },
@@ -455,7 +545,7 @@ impl<'rwlock, T: ?Sized> RwLockUpgradeableGuard<'rwlock, T> {
     /// ```
     pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
         // Reserve the read guard for ourselves
-        self.lock.fetch_add(READER, Ordering::Acquire);
+        fetch_add(&self.lock, READER, Ordering::Acquire);
 
         RwLockReadGuard {
             lock: &self.lock,
@@ -482,7 +572,7 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
     #[inline]
     pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T> {
         // Reserve the read guard for ourselves
-        self.lock.fetch_add(READER, Ordering::Acquire);
+        fetch_add(&self.lock, READER, Ordering::Acquire);
 
         RwLockReadGuard {
             lock: &self.lock,
@@ -526,7 +616,7 @@ impl<'rwlock, T: ?Sized> DerefMut for RwLockWriteGuard<'rwlock, T> {
 impl<'rwlock, T: ?Sized> Drop for RwLockReadGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
-        self.lock.fetch_sub(READER, Ordering::Release);
+        fetch_sub(self.lock, READER, Ordering::Release);
     }
 }
 
@@ -536,7 +626,7 @@ impl<'rwlock, T: ?Sized> Drop for RwLockUpgradeableGuard<'rwlock, T> {
             self.lock.load(Ordering::Relaxed) & (WRITER | UPGRADED),
             UPGRADED
         );
-        self.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
+        fetch_sub(self.lock, UPGRADED, Ordering::AcqRel);
     }
 }
 
@@ -546,10 +636,33 @@ impl<'rwlock, T: ?Sized> Drop for RwLockWriteGuard<'rwlock, T> {
 
         // Writer is responsible for clearing both WRITER and UPGRADED bits.
         // The UPGRADED bit may be set if an upgradeable lock attempts an upgrade while this lock is held.
-        self.lock.fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+        fetch_and(self.lock, !(WRITER | UPGRADED), Ordering::Release);
     }
 }
 
+#[cfg(not(target_has_atomic = "cas"))]
+#[inline(always)]
+fn compare_exchange(
+    atomic: &AtomicUsize,
+    current: usize,
+    new: usize,
+    _success: Ordering,
+    _failure: Ordering,
+    _strong: bool,
+) -> Result<usize, usize> {
+    disable_interrupts();
+    let x = atomic.load(Ordering::SeqCst);
+    let ret = if x == current {
+        atomic.store(new, Ordering::SeqCst);
+        Result::Ok(x)
+    } else {
+        Result::Err(x)
+    };
+    enable_interrupts();
+    ret
+}
+
+#[cfg(target_has_atomic = "cas")]
 #[inline(always)]
 fn compare_exchange(
     atomic: &AtomicUsize,
