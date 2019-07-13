@@ -67,6 +67,24 @@ impl<T> Once<T> {
         }
     }
 
+    #[cfg(target_has_atomic = "cas")]
+    fn cas_state(&self, old: usize, new: usize) -> usize
+    {
+        self.state.compare_and_swap(old, new, Ordering::SeqCst)
+    }
+
+    #[cfg(not(target_has_atomic = "cas"))]
+    fn cas_state(&self, old: usize, new: usize) -> usize
+    {
+        let x = self.state.load(Ordering::SeqCst);
+        if x == old {
+            self.state.store(new, Ordering::SeqCst);
+            old
+        } else {
+            x
+        }
+    }
+
     /// Performs an initialization routine once and only once. The given closure
     /// will be executed if this is the first time `call_once` has been called,
     /// and otherwise the routine will *not* be invoked.
@@ -101,9 +119,7 @@ impl<T> Once<T> {
         let mut status = self.state.load(Ordering::SeqCst);
 
         if status == INCOMPLETE {
-            status = self.state.compare_and_swap(INCOMPLETE,
-                                                 RUNNING,
-                                                 Ordering::SeqCst);
+            status = self.cas_state(INCOMPLETE, RUNNING);
             if status == INCOMPLETE { // We init
                 // We use a guard (Finish) to catch panics caused by builder
                 let mut finish = Finish { state: &self.state, panicked: true };

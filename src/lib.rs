@@ -1,5 +1,6 @@
 #![crate_type = "lib"]
 #![warn(missing_docs)]
+#![feature(cfg_target_has_atomic)]
 
 //! Synchronization primitives based on spinning
 

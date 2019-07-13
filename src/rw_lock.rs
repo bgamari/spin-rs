@@ -112,6 +112,37 @@ impl<T> RwLock<T>
     }
 }
 
+#[cfg(target_has_atomic = "cas")]
+fn decrement_lock(lock: &AtomicUsize)
+{
+    lock.fetch_sub(1, Ordering::SeqCst);
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn decrement_lock(lock: &AtomicUsize)
+{
+    let x = lock.load(Ordering::SeqCst);
+    lock.store(x-1, Ordering::SeqCst);
+}
+
+#[cfg(target_has_atomic = "cas")]
+fn cas_lock(lock: &AtomicUsize, old: usize, new: usize) -> usize
+{
+    lock.compare_and_swap(old, new, Ordering::SeqCst)
+}
+
+#[cfg(not(target_has_atomic = "cas"))]
+fn cas_lock(lock: &AtomicUsize, old: usize, new: usize) -> usize
+{
+    let x = lock.load(Ordering::SeqCst);
+    if x == old {
+        lock.store(new, Ordering::SeqCst);
+        old
+    } else {
+        x
+    }
+}
+
 impl<T: ?Sized> RwLock<T>
 {
     /// Locks this rwlock with shared read access, blocking the current thread
@@ -158,7 +189,7 @@ impl<T: ?Sized> RwLock<T>
             let new = old + 1;
             debug_assert!(new != (!USIZE_MSB) & (!0));
 
-            self.lock.compare_and_swap(old, new, Ordering::SeqCst) != old
+            cas_lock(&self.lock, old, new) != old
         } {
             cpu_relax();
         }
@@ -198,9 +229,7 @@ impl<T: ?Sized> RwLock<T>
 
         let new = old + 1;
         debug_assert!(new != (!USIZE_MSB) & (!0));
-        if self.lock.compare_and_swap(old,
-                                      new,
-                                      Ordering::SeqCst) == old
+        if cas_lock(&self.lock, old, new) == old
         {
             Some(RwLockReadGuard {
                 lock: &self.lock,
@@ -219,7 +248,7 @@ impl<T: ?Sized> RwLock<T>
     /// RAII.
     pub unsafe fn force_read_decrement(&self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & (!USIZE_MSB) > 0);
-        self.lock.fetch_sub(1, Ordering::SeqCst);
+        decrement_lock(&self.lock);
     }
 
     /// Force unlock exclusive write access.
@@ -259,9 +288,7 @@ impl<T: ?Sized> RwLock<T>
             let old = (!USIZE_MSB) & self.lock.load(Ordering::Relaxed);
             // Old value, with write bit set.
             let new = USIZE_MSB | old;
-            if self.lock.compare_and_swap(old,
-                                          new,
-                                          Ordering::SeqCst) == old
+            if cas_lock(&self.lock, old, new) == old
             {
                 // Wait for readers to go away, then lock is ours.
                 while self.lock.load(Ordering::Relaxed) != USIZE_MSB {
@@ -298,9 +325,7 @@ impl<T: ?Sized> RwLock<T>
     #[inline]
     pub fn try_write(&self) -> Option<RwLockWriteGuard<T>>
     {
-        if self.lock.compare_and_swap(0,
-                                      USIZE_MSB,
-                                      Ordering::SeqCst) == 0
+        if cas_lock(&self.lock, 0, USIZE_MSB) == 0
         {
             Some(RwLockWriteGuard {
                 lock: &self.lock,
@@ -351,7 +376,7 @@ impl<'rwlock, T: ?Sized> DerefMut for RwLockWriteGuard<'rwlock, T> {
 impl<'rwlock, T: ?Sized> Drop for RwLockReadGuard<'rwlock, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & (!USIZE_MSB) > 0);
-        self.lock.fetch_sub(1, Ordering::SeqCst);
+        decrement_lock(&self.lock);
     }
 }
 
